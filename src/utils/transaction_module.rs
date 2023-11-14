@@ -1,6 +1,8 @@
 use crate::models::{network::Network, token_address::TokenAddress, transaction::Transaction};
+use crate::utils::{auth, encryption};
 use anyhow::Error;
-use jsonwebtoken::{encode, EncodingKey, Header};
+use p256::ecdsa::VerifyingKey;
+use p256::ecdsa::{signature::Signer, Signature, SigningKey};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use sqlx::types::Json;
@@ -15,7 +17,7 @@ use web3::types::{
     Address, Block, BlockId, BlockNumber, Bytes, CallRequest, TransactionId, TransactionReceipt,
     H160, H256, U256, U64,
 };
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 struct TxRequest {
     pub chain_id: String,
     pub to: String,
@@ -24,7 +26,7 @@ struct TxRequest {
     pub gas: String,
     pub gas_price: String,
 }
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, Deserialize)]
 struct TxBroadcastRequest {
     network_rpc: String,
     bridge_address: String,
@@ -34,9 +36,11 @@ struct TxBroadcastRequest {
 }
 
 #[derive(Debug, Deserialize)]
-struct ResponseRaw {
-    status: String,
-    data: Bytes,
+pub struct ResponseRaw {
+    pub status: String,
+    pub data: Vec<u8>,
+    pub message: [u8; 32],
+    pub signature: Vec<u8>,
 }
 
 pub fn generate_error_response(field_name: &str) -> Result<Value, Error> {
@@ -495,35 +499,69 @@ pub async fn send_erc20(pool: &Pool<Postgres>, transaction: &Transaction) -> Res
         token_address: Some(token.token_address),
         abi: Some(abi),
     };
-    println!("Broadcast Tx Field: {:?}", tx_req.clone());
     let json_body = match serde_json::to_string(&broadcast_tx_field) {
         Ok(json_body) => json_body,
         Err(err) => return Err(Error::msg(format!("Error parsing body: {:?}", err))),
     };
-    let client = reqwest::Client::new();
-    let jwt_token = match generate_key().await {
-        Ok(token) => token,
-        Err(err) => return Err(err),
+
+    //perform encryption
+    let pk: (
+        Vec<u8>,
+        p256::elliptic_curve::ecdh::EphemeralSecret<p256::NistP256>,
+    ) = auth::bridge_generate_pk();
+    let hsm_pk = auth::get_pk(&pk.0).await.expect("Failed to get pk");
+    let sk = auth::generate_sk(hsm_pk, pk.1).await;
+    let ciphertext = encryption::encrypt(json_body.as_str(), &sk);
+
+    // perform tx signing before sending
+    let s_tx = sign_on_tx(&ciphertext, &sk)
+        .await
+        .expect("Error While Signing Tx");
+    // serialize the sign_tx struct to string
+    let sign_tx_json_string = match serde_json::to_string(&s_tx) {
+        Ok(json_body) => json_body,
+        Err(err) => return Err(Error::msg(format!("Error parsing body: {:?}", err))),
     };
-    let path = match dotenvy::var("PATH_RAW") {
-        Ok(path) => path,
-        Err(err) => return Err(err.into()),
+    #[derive(Debug, Serialize)]
+    struct SendTxPayload {
+        sign_tx: String,
+        pk: Vec<u8>,
+    }
+    // initalize payload and serialize into string
+    let s_tx_struct = SendTxPayload {
+        sign_tx: sign_tx_json_string,
+        pk: pk.0,
     };
-    let res = client
-        .post(format!("{}/sign-erc20-tx", path))
-        .header(reqwest::header::CONTENT_TYPE, "application/json")
-        .header(
-            reqwest::header::AUTHORIZATION,
-            format!("Bearer {}", jwt_token),
-        )
-        .body(json_body)
-        .send()
-        .await?;
-    let res_data = res.text().await?;
-    let response: ResponseRaw = serde_json::from_str(&res_data)?;
-    println!("Response: {:#?}", response);
+    let s_tx_json = serde_json::to_string(&s_tx_struct).unwrap();
+
+    // post tx to hsm
+    let response = match post_tx(s_tx_json).await {
+        Ok(res) => res,
+        Err(err) => return Err(Error::msg(format!("Error while posting tx: {}", err))),
+    };
+    println!("Response: {:?}", response);
+
     let rlp = if response.status == "success" {
-        response.data
+        // decrypte received raw tx
+        let decrypted_bytes = encryption::decrypt(&response.data, &sk);
+        println!("decrypted raw: {}", decrypted_bytes);
+
+        // deserialize raw tx
+        let raw_tx_bytes: Bytes =
+            serde_json::from_str(&decrypted_bytes).expect("failed to deserialize");
+        println!("Raw signed tx: {:?}", raw_tx_bytes);
+
+        // perform signature verification, return error if signature's public address != hsm public address
+        let rec = web3::types::Recovery::from_raw_signature(response.message, &response.signature)
+            .expect("failed to init recovery");
+        let public_add = recover(rec).expect("init recovery failed");
+        println!("Signature public address: {:?}", public_add);
+        let bridge_pub_add = dotenvy::var("PUBLIC_ADDRESS").expect("Public address not found");
+        if format!("{:?}", public_add).as_bytes() != bridge_pub_add.to_lowercase().as_bytes() {
+            return Err(Error::msg("HSM Public Address not match"));
+        }
+
+        raw_tx_bytes
     } else {
         return Err(Error::msg("Raw Tx Not Found"));
     };
@@ -594,30 +632,66 @@ pub async fn send_raw_tx(pool: &Pool<Postgres>, transaction: &Transaction) -> Re
         Ok(json_body) => json_body,
         Err(err) => return Err(Error::msg(format!("Error parsing body: {:?}", err))),
     };
-    let client = reqwest::Client::new();
-    let jwt_token = match generate_key().await {
-        Ok(token) => token,
-        Err(err) => return Err(err),
+    println!("Tx Feild Vec: {:?}", &json_body);
+
+    //perform encryption
+    let pk: (
+        Vec<u8>,
+        p256::elliptic_curve::ecdh::EphemeralSecret<p256::NistP256>,
+    ) = auth::bridge_generate_pk();
+    let hsm_pk = auth::get_pk(&pk.0).await.expect("Failed to get pk");
+    let sk = auth::generate_sk(hsm_pk, pk.1).await;
+    let ciphertext = encryption::encrypt(json_body.as_str(), &sk);
+
+    // perform tx signing before sending
+    let s_tx = sign_on_tx(&ciphertext, &sk)
+        .await
+        .expect("Error While Signing Tx");
+    // serialize the sign_tx struct to string
+    let sign_tx_json_string = match serde_json::to_string(&s_tx) {
+        Ok(json_body) => json_body,
+        Err(err) => return Err(Error::msg(format!("Error parsing body: {:?}", err))),
     };
-    let path = match dotenvy::var("PATH_RAW") {
-        Ok(path) => path,
-        Err(err) => return Err(err.into()),
+    #[derive(Debug, Serialize)]
+    struct SendTxPayload {
+        sign_tx: String,
+        pk: Vec<u8>,
+    }
+    // initalize payload and serialize into string
+    let s_tx_struct = SendTxPayload {
+        sign_tx: sign_tx_json_string,
+        pk: pk.0,
     };
-    let res = client
-        .post(format!("{}/sign-raw-tx", path))
-        .header(reqwest::header::CONTENT_TYPE, "application/json")
-        .header(
-            reqwest::header::AUTHORIZATION,
-            format!("Bearer {}", jwt_token),
-        )
-        .body(json_body)
-        .send()
-        .await?;
-    let res_data = res.text().await?;
-    let response: ResponseRaw = serde_json::from_str(&res_data)?;
-    println!("Response: {:#?}", response);
+    let s_tx_json = serde_json::to_string(&s_tx_struct).unwrap();
+
+    // post tx to hsm
+    let response = match post_tx(s_tx_json).await {
+        Ok(res) => res,
+        Err(err) => return Err(Error::msg(format!("Error while posting tx: {}", err))),
+    };
+    println!("Response: {:?}", response);
+
     let rlp = if response.status == "success" {
-        response.data
+        // decrypte received raw tx
+        let decrypted_bytes = encryption::decrypt(&response.data, &sk);
+        println!("decrypted raw: {}", decrypted_bytes);
+
+        // deserialize raw tx
+        let raw_tx_bytes: Bytes =
+            serde_json::from_str(&decrypted_bytes).expect("failed to deserialize");
+        println!("Raw signed tx: {:?}", raw_tx_bytes);
+
+        // perform signature verification, return error if signature's public address != hsm public address
+        let rec = web3::types::Recovery::from_raw_signature(response.message, &response.signature)
+            .expect("failed to init recovery");
+        let public_add = recover(rec).expect("init recovery failed");
+        println!("Signature public address: {:?}", public_add);
+        let bridge_pub_add = dotenvy::var("PUBLIC_ADDRESS").expect("Public address not found");
+        if format!("{:?}", public_add).as_bytes() != bridge_pub_add.to_lowercase().as_bytes() {
+            return Err(Error::msg("HSM Public Address not match"));
+        }
+
+        raw_tx_bytes
     } else {
         return Err(Error::msg("Raw Tx Not Found"));
     };
@@ -643,38 +717,75 @@ async fn broadcast_tx(network_rpc: String, rlp: Bytes) -> Result<H256, Error> {
     Ok(tx_hash)
 }
 
-pub async fn generate_key() -> Result<String, Error> {
-    // Assuming these are the valid credentials for demonstration purposes
-    let public_key = match dotenvy::var("PUBLIC_KEY") {
-        Ok(p) => p,
-        Err(err) => {
-            return Err(err.into());
-        }
-    };
-    let secret_key = dotenvy::var("SECRET_KEY").expect("Secret key cannot be empty");
-    let now = chrono::Utc::now();
-    let iat = now.timestamp() as usize;
-    let exp = (now + chrono::Duration::minutes(1)).timestamp() as usize;
-    #[derive(Debug, Serialize, Deserialize)]
-    struct Claims {
-        sub: String,
-        role: String,
-        iat: usize,
-        exp: usize,
-    }
-    // Generate a JWT token
-    let claims = Claims {
-        sub: public_key,
-        role: "admin".to_string(),
-        iat,
-        exp,
-    };
-    let token = encode(
-        &Header::default(),
-        &claims,
-        &EncodingKey::from_secret(secret_key.as_ref()),
-    )
-    .unwrap();
+async fn post_tx(tx_json: String) -> Result<ResponseRaw, Error> {
+    let client = reqwest::Client::new();
 
-    Ok(token)
+    let jwt_token = match auth::generate_jwt_key().await {
+        Ok(token) => token,
+        Err(err) => return Err(err),
+    };
+
+    let hsm_domain = match dotenvy::var("HSM_DOMAIN") {
+        Ok(path) => path,
+        Err(err) => return Err(err.into()),
+    };
+    let hsm_port = match dotenvy::var("HSM_PORT") {
+        Ok(path) => path,
+        Err(err) => return Err(err.into()),
+    };
+    let hsm_erc_path = match dotenvy::var("HSM_ERC20_PATH") {
+        Ok(path) => path,
+        Err(err) => return Err(err.into()),
+    };
+    let res = client
+        .post(format!("{}:{}/{}", hsm_domain, hsm_port, hsm_erc_path))
+        .header(reqwest::header::CONTENT_TYPE, "application/json")
+        .header(
+            reqwest::header::AUTHORIZATION,
+            format!("Bearer {}", jwt_token),
+        )
+        .body(tx_json)
+        .send()
+        .await?;
+    let res_data = res.text().await?;
+    let response: ResponseRaw = serde_json::from_str(&res_data)?;
+    Ok(response)
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct SignTx {
+    pub message: Vec<u8>,
+    pub signature: Vec<u8>,
+    pub v_key: Vec<u8>,
+}
+
+pub async fn sign_on_tx(tx_raw: &[u8], sk: &[u8]) -> anyhow::Result<SignTx> {
+    // get pub key
+    let signing_key = SigningKey::from_slice(sk).expect("Signing Key Error");
+
+    let verifying_key = SigningKey::verifying_key(&signing_key);
+
+    let encode_v = VerifyingKey::to_encoded_point(verifying_key, true);
+    let message = tx_raw;
+    let signature: Signature = signing_key.sign(message);
+    let s_bytes = Signature::to_bytes(&signature);
+
+    Ok(SignTx {
+        message: message.to_vec(),
+        signature: s_bytes.to_vec(),
+        v_key: encode_v.to_bytes().to_vec(),
+    })
+}
+
+pub fn recover(recovery: web3::types::Recovery) -> anyhow::Result<Address> {
+    // let recovery: web3::types::Recovery = recovery.into();
+    let message_hash = match recovery.message {
+        web3::types::RecoveryMessage::Data(ref message) => web3::signing::hash_message(message),
+        web3::types::RecoveryMessage::Hash(hash) => hash,
+    };
+    let (signature, recovery_id) = recovery.as_signature().ok_or(web3::Error::Recovery(
+        web3::signing::RecoveryError::InvalidSignature,
+    ))?;
+    let address = web3::signing::recover(message_hash.as_bytes(), &signature, recovery_id)?;
+    Ok(address)
 }
