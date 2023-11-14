@@ -4,8 +4,8 @@ pub mod routers;
 pub mod utils;
 
 use crate::routers::{
-    hsm_routes::sign_tx_routes, network_routes::network_routes,
-    token_address_routes::token_address_routes, transaction_routes::transaction_routes,
+    network_routes::network_routes, token_address_routes::token_address_routes,
+    transaction_routes::transaction_routes,
 };
 use axum::{
     http::{
@@ -43,8 +43,15 @@ async fn main() -> anyhow::Result<()> {
     tracing_subscriber::fmt()
         .with_max_level(tracing::Level::DEBUG)
         .init();
+    // bridge server
+    let bridge_domain = dotenvy::var("BRIDGE_DOMAIN").expect("HSM Domain not found");
+    let bridge_port = dotenvy::var("BRIDGE_PORT").expect("HSM Port not found");
     let cors = CorsLayer::new()
-        .allow_origin("http://localhost:8000".parse::<HeaderValue>().unwrap())
+        .allow_origin(
+            format!("{}:{}", bridge_domain, bridge_port)
+                .parse::<HeaderValue>()
+                .unwrap(),
+        )
         .allow_methods([Method::GET, Method::POST, Method::PATCH, Method::DELETE])
         .allow_credentials(true)
         .allow_headers([AUTHORIZATION, ACCEPT, CONTENT_TYPE]);
@@ -55,28 +62,14 @@ async fn main() -> anyhow::Result<()> {
             db: pool.clone(),
         })))
         .layer(cors);
-    let cors2 = CorsLayer::new()
-        .allow_origin("http://localhost:7000".parse::<HeaderValue>().unwrap())
-        .allow_methods([Method::GET, Method::POST])
-        .allow_credentials(true)
-        .allow_headers([AUTHORIZATION, ACCEPT, CONTENT_TYPE]);
-    let app2 = Router::new().merge(sign_tx_routes()).layer(cors2);
-    println!("🚀 Server started successfully, port 8000");
-    println!("🚀 HSM Server started successfully, port 7000");
+    println!("🚀 Server started successfully, port {}", bridge_port);
+    // println!("🚀 HSM Server started successfully, port {}", hsm_port);
     let server1 = task::spawn(async move {
-        axum::Server::bind(&"0.0.0.0:8000".parse().unwrap())
+        axum::Server::bind(&format!("0.0.0.0:{}", bridge_port).parse().unwrap())
             .serve(app.into_make_service())
             .await
             .unwrap();
     });
-    let server2 = task::spawn(async move {
-        axum::Server::bind(&"0.0.0.0:7000".parse().unwrap())
-            .serve(app2.into_make_service())
-            .await
-            .unwrap();
-    });
     server1.await.unwrap();
-    server2.await.unwrap();
-
     Ok(())
 }
