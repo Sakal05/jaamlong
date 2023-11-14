@@ -12,7 +12,7 @@ Add necessary variable to .env file. See .env.example necessary variables
    - Inside the '.env' file, fill in the 
     </br>SECRET_KEY,
     </br>PUBLIC_KEY,
-    </br>PATH_RAW="http://127.0.0.1:7000"
+    </br>HSM_PATH="http://127.0.0.1:7000"
 
 ## Broadcast Request Setup
 Send POST request to 127.0.0.1:8000/broadcast-tx with raw json body of 
