@@ -374,6 +374,7 @@ pub async fn request_tx(
         "status": "success",
         "data": response_tx
     });
+
     Ok(Json(json_response))
 }
 
@@ -808,7 +809,6 @@ pub async fn broadcast_tx(
     //         return Ok(Json(json_response));
     //     }
     // };
-    // ============ WILL MOVE TO HSM SIGN TX MACHANISM =================
     let tx: H256 = if to_token.asset_type == "0" {
         match send_raw_tx(&data.db, &transaction).await {
             Ok(tx_hash) => tx_hash,
